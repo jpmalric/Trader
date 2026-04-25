@@ -1,0 +1,32 @@
+[
+  {
+    "id": "08c47fe5",
+    "ticker": "WKL.AS",
+    "nom": "Wolters Kluwer",
+    "quantite": 35.0,
+    "prix_achat": 70.11,
+    "date_achat": "2026-04-21",
+    "stop_loss": -15.0,
+    "take_profit": 30.0
+  },
+  {
+    "id": "fb78d4b8",
+    "ticker": "SAF.PA",
+    "nom": "SAfran",
+    "quantite": 6.0,
+    "prix_achat": 287.27,
+    "date_achat": "2026-04-21",
+    "stop_loss": -15.0,
+    "take_profit": 30.0
+  },
+  {
+    "id": "99789339",
+    "ticker": "ASML.AS",
+    "nom": "ASML",
+    "quantite": 1.0,
+    "prix_achat": 1248.4,
+    "date_achat": "2026-04-21",
+    "stop_loss": -15.0,
+    "take_profit": 30.0
+  }
+]
