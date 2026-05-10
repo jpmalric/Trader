@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python \"c:\\\\Users\\\\jeanp\\\\Documents\\\\GitHub\\\\Trader\\\\test_yf.py\" 2>&1)",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\jeanp\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-jeanp-Documents-GitHub-Trader\\\\47d45791-c786-48be-9e08-8eb5a43f4a65\\\\tasks\\\\bdv2vvrnp.output\" -Wait -Tail 30)",
+      "PowerShell(Start-Process \"c:\\\\Users\\\\jeanp\\\\Documents\\\\GitHub\\\\Trader\\\\pea_report.html\")",
+      "Bash(python generate_report.py)",
+      "Bash(python pea_screener.py --top 200)",
+      "Bash(python pea_screener.py --top 5)",
+      "Bash(python world_screener.py --top 5)",
+      "Bash(python send_reports.py --test)",
+      "Bash(schtasks /delete /tn \"ScreenerQuotidien\" /f)",
+      "Bash(schtasks /create /tn \"ScreenerQuotidien\" /tr \"\\\\\"C:\\\\Users\\\\jeanp\\\\Documents\\\\GitHub\\\\Trader\\\\run_daily.bat\\\\\"\" /sc daily /st 08:30 /ru \"%USERNAME%\" /rl HIGHEST /it /f)"
+    ]
+  }
+}
