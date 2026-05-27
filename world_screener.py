@@ -387,6 +387,16 @@ def fetch_analyst_data(session: YahooSession, symbol: str) -> dict | None:
                 if total_rev > 0:
                     eps_revision = round((up30 - dn30) / total_rev * 100, 1)
 
+            # Dividende
+            div_rate       = _v(sd.get("dividendRate"))
+            div_yield_raw  = sd.get("dividendYield")
+            div_yield      = _pct(div_yield_raw) if div_yield_raw else None
+            ex_div_epoch   = _v(sd.get("exDividendDate"))
+            last_div_val   = _v(sd.get("lastDividendValue"))
+            last_div_epoch = _v(sd.get("lastDividendDate"))
+            ex_div_str     = datetime.fromtimestamp(int(ex_div_epoch)).strftime("%d/%m/%Y") if ex_div_epoch else None
+            last_div_str   = datetime.fromtimestamp(int(last_div_epoch)).strftime("%d/%m/%Y") if last_div_epoch else None
+
             return {
                 "symbol":       symbol,
                 "name":         qt.get("longName") or qt.get("shortName") or "",
@@ -415,6 +425,11 @@ def fetch_analyst_data(session: YahooSession, symbol: str) -> dict | None:
                 "debt_equity":  debt_equity,
                 "mom_52w":      mom_52w,
                 "eps_revision": eps_revision,
+                "div_rate":     div_rate,
+                "div_yield":    div_yield,
+                "ex_div_date":  ex_div_str,
+                "last_div_val": last_div_val,
+                "last_div_date": last_div_str,
                 "score":        int(count) * (6.0 - float(mean)),
                 "composite":    None,
                 "grade":        None,
@@ -716,6 +731,18 @@ def generate_html_report(output: Path, h1: str, accent: str = "#38bdf8") -> None
         c = "#16a34a" if val > 0 else "#ef4444"; s = "+" if val > 0 else ""
         return f'<td class="center" style="color:{c};font-weight:600">{s}{val:.1f}%</td>'
 
+    def _div_cell(r):
+        rate = r.get("div_rate") or r.get("last_div_val")
+        ex_d = r.get("ex_div_date") or r.get("last_div_date")
+        cur  = r.get("currency", "")
+        if rate is None:
+            return '<td class="center gray div-cell">—</td>'
+        rate_str = f"{rate:.2f} {cur}".strip()
+        dy = r.get("div_yield")
+        dy_html   = f'<div class="div-yield">({dy:.2f}%)</div>' if dy else ""
+        date_html = f'<div class="div-date">{ex_d}</div>' if ex_d else ""
+        return f'<td class="center small div-cell"><div class="div-amount">{rate_str}</div>{dy_html}{date_html}</td>'
+
     def _compbar(score):
         if score is None: return '<div class="comp-na">N/A</div>'
         c = ("#16a34a" if score >= 80 else "#22c55e" if score >= 60
@@ -791,7 +818,7 @@ def generate_html_report(output: Path, h1: str, accent: str = "#38bdf8") -> None
                           f'<table class="firms-table"><thead><tr>'
                           f'<th>Cabinet</th><th>Recommandation</th><th>Action</th><th>Date</th>'
                           f'</tr></thead><tbody>{rows_f}</tbody></table>')
-        return (f'<tr id="detail-{idx}" class="detail-row" style="display:none"><td colspan="12">'
+        return (f'<tr id="detail-{idx}" class="detail-row" style="display:none"><td colspan="13">'
                 f'<div class="detail-container"><div class="detail-score">{score_sec}</div>'
                 f'<div class="detail-firms">{firms_html}</div></div></td></tr>')
 
@@ -827,6 +854,7 @@ def generate_html_report(output: Path, h1: str, accent: str = "#38bdf8") -> None
                       f'<td class="center">{n_ana}</td><td>{_breakdown(r)}</td><td>{_buybar(buy_p)}</td>'
                       f'{_upside(r.get("upside_pct"))}'
                       f'<td class="center small price-cell">{price_td}</td>'
+                      f'{_div_cell(r)}'
                       f'<td class="center">{_cbadge(r.get("consensus", ""))}</td>'
                       f'<td class="center">{tbtn}</td></tr>'
                       f'{_detail_row(i, firms, sd)}')
@@ -897,6 +925,10 @@ def generate_html_report(output: Path, h1: str, accent: str = "#38bdf8") -> None
   .price-cell {{ min-width: 100px; }}
   .price-cur {{ font-weight: 500; color: #e2e8f0; font-size: 12px; }}
   .price-tgt {{ color: #64748b; font-size: 11px; margin-top: 2px; }} .price-ccy {{ color: #475569; }}
+  .div-cell {{ min-width: 90px; }}
+  .div-amount {{ font-weight: 500; color: #e2e8f0; font-size: 12px; }}
+  .div-yield {{ color: #22c55e; font-size: 11px; margin-top: 1px; }}
+  .div-date {{ color: #64748b; font-size: 11px; margin-top: 2px; }}
   .toggle-btn {{ background: #1e293b; border: 1px solid #334155; color: #94a3b8;
                  padding: 3px 8px; border-radius: 6px; font-size: 11px; cursor: pointer; white-space: nowrap; transition: all .15s; }}
   .toggle-btn:hover {{ background: #334155; color: #e2e8f0; }}
@@ -964,8 +996,8 @@ def generate_html_report(output: Path, h1: str, accent: str = "#38bdf8") -> None
       <th>#</th><th>Score composite</th><th>Note</th><th>Symbole</th>
       <th>Société / Secteur</th><th class="center">Analystes</th>
       <th>Répartition</th><th>% Achat</th><th class="center">Upside</th>
-      <th class="center">Prix / Cible</th><th class="center">Consensus</th>
-      <th class="center">Cabinets</th>
+      <th class="center">Prix / Cible</th><th class="center">Dividende</th>
+      <th class="center">Consensus</th><th class="center">Cabinets</th>
     </tr></thead>
     <tbody>{rows_html}</tbody>
   </table>
