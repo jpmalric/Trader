@@ -10,7 +10,9 @@
       "Bash(python world_screener.py --top 5)",
       "Bash(python send_reports.py --test)",
       "Bash(schtasks /delete /tn \"ScreenerQuotidien\" /f)",
-      "Bash(schtasks /create /tn \"ScreenerQuotidien\" /tr \"\\\\\"C:\\\\Users\\\\jeanp\\\\Documents\\\\GitHub\\\\Trader\\\\run_daily.bat\\\\\"\" /sc daily /st 08:30 /ru \"%USERNAME%\" /rl HIGHEST /it /f)"
+      "Bash(schtasks /create /tn \"ScreenerQuotidien\" /tr \"\\\\\"C:\\\\Users\\\\jeanp\\\\Documents\\\\GitHub\\\\Trader\\\\run_daily.bat\\\\\"\" /sc daily /st 08:30 /ru \"%USERNAME%\" /rl HIGHEST /it /f)",
+      "Bash(dotnet --version)",
+      "Bash(npm --version)"
     ]
   }
 }
