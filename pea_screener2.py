@@ -202,6 +202,27 @@ for _lst in STOCKS_PEA.values():
             _seen.add(_t)
             ALL_TICKERS.append(_t)
 
+# ── Éligibilité PEA (siège social UE/EEE) ────────────────────────────────────────
+# Le PEA exige que l'émetteur ait son siège dans l'UE ou l'EEE. La cotation sur une
+# place européenne ne suffit pas : ex. Unilever PLC (siège UK depuis 2020) ou un
+# titre suisse ne sont PAS éligibles. On filtre sur le pays Yahoo (nom complet).
+
+PEA_ELIGIBLE_COUNTRIES: set[str] = {
+    "France", "Germany", "Spain", "Netherlands", "Italy", "Sweden", "Belgium",
+    "Finland", "Denmark", "Austria", "Norway", "Luxembourg", "Ireland",
+    "Portugal", "Greece", "Poland", "Czech Republic", "Czechia", "Hungary",
+    "Romania", "Slovakia", "Slovenia", "Croatia", "Bulgaria", "Estonia",
+    "Latvia", "Lithuania", "Cyprus", "Malta", "Iceland", "Liechtenstein",
+}
+
+
+def pea_eligibility(country: str) -> bool | None:
+    """True si siège UE/EEE, False si hors zone (UK/CH/US…), None si inconnu."""
+    c = (country or "").strip()
+    if not c:
+        return None
+    return c in PEA_ELIGIBLE_COUNTRIES
+
 # ── Cache ──────────────────────────────────────────────────────────────────────
 
 def load_cache() -> list | None:
@@ -668,11 +689,19 @@ CONSENSUS_LABEL = {
     "underperform":"SOUS-PERF","sell":"VENTE","strong_sell":"VENTE FORTE",
 }
 
-def display_results(df: pd.DataFrame, top_n: int, min_composite: float) -> None:
+def display_results(df: pd.DataFrame, top_n: int, min_composite: float,
+                    pea_strict: bool = False) -> None:
     if df.empty:
         print("Aucun résultat.")
         return
     df = df.copy()
+    excluded: list[str] = []
+    unknown: list[str] = []
+    if pea_strict and "country" in df.columns:
+        elig = df["country"].apply(pea_eligibility)
+        excluded = df.loc[elig == False, "symbol"].tolist()        # noqa: E712
+        unknown = df.loc[elig.isna(), "symbol"].tolist()
+        df = df[elig != False]                                     # garde éligibles + inconnus
     if "composite" in df.columns:
         df = df[df["composite"].notna() & (df["composite"] >= min_composite)]
         df = df.sort_values("composite", ascending=False)
@@ -707,7 +736,12 @@ def display_results(df: pd.DataFrame, top_n: int, min_composite: float) -> None:
         )
     print("-" * W)
     n_qarp = int(df["conviction"].sum()) if "conviction" in df.columns else 0
-    print(f"\n  {len(df)} actions | score ≥ {min_composite} | {n_qarp} QARP | {datetime.now().strftime('%d/%m/%Y %H:%M')}\n")
+    strict_s = " | PEA strict" if pea_strict else ""
+    print(f"\n  {len(df)} actions | score ≥ {min_composite} | {n_qarp} QARP{strict_s} | {datetime.now().strftime('%d/%m/%Y %H:%M')}\n")
+    if pea_strict and excluded:
+        print(f"  ⚠ Exclus (siège hors UE/EEE, non PEA-éligibles) : {', '.join(excluded)}")
+    if pea_strict and unknown:
+        print(f"  ? Pays inconnu (conservés, à vérifier) : {', '.join(unknown)}")
 
 # ── Génération rapport HTML ────────────────────────────────────────────────────
 
@@ -1322,6 +1356,9 @@ def main() -> None:
     parser.add_argument("--min-score",     type=float, default=0.0,
                         help="Score composite minimum 0-100 (défaut: 0 = tout afficher)")
     parser.add_argument("--min-analysts",  type=int,   default=MIN_ANALYSTS)
+    parser.add_argument("--pea-strict",    action="store_true",
+                        help="N'affiche que les titres dont le siège est en UE/EEE "
+                             "(exclut UK/Suisse/US, ex. Unilever PLC)")
     args = parser.parse_args()
 
     MIN_ANALYSTS = args.min_analysts
@@ -1330,7 +1367,8 @@ def main() -> None:
         enrich_with_firms()
     else:
         df = run_screener(force_refresh=args.refresh, min_analysts=args.min_analysts)
-        display_results(df, top_n=args.top, min_composite=args.min_score)
+        display_results(df, top_n=args.top, min_composite=args.min_score,
+                        pea_strict=args.pea_strict)
 
     print("\nGénération du rapport HTML v2...")
     generate_html_report(Path("pea_report2.html"))
