@@ -5,6 +5,9 @@
 .tr_login_status
 .mcp.json
 
+# Caches dérivés (régénérés automatiquement)
+isin_map.json
+
 # Python
 __pycache__/
 *.pyc
