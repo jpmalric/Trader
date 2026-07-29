@@ -35,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -101,6 +102,76 @@ def _normalize_phone(phone: str) -> str:
     return p
 
 
+# Anti-spam 2FA : Trade Republic arrête d'envoyer les SMS si on demande des codes
+# trop rapprochés (il renvoie quand même HTTP 200 + un countdown → on croit à tort
+# que « rien n'arrive »). On mémorise l'heure du dernier code demandé.
+_LAST_2FA_FILE = Path(__file__).with_name(".tr_last_2fa")
+_SMS_COOLDOWN_S = 90       # délai conseillé avant de RE-demander un code
+_RESEND_MIN_S = 30         # délai mini imposé avant un renvoi (endpoint resend)
+
+
+def _since_last_2fa():
+    """Secondes depuis la dernière demande de code (None si jamais)."""
+    try:
+        return time.time() - _LAST_2FA_FILE.stat().st_mtime
+    except FileNotFoundError:
+        return None
+
+
+def _sms_cooldown_guard():
+    """Avertit (avec confirmation) si un code 2FA a été demandé il y a peu."""
+    elapsed = _since_last_2fa()
+    if elapsed is not None and elapsed < _SMS_COOLDOWN_S:
+        wait = int(_SMS_COOLDOWN_S - elapsed)
+        print(f"⚠️  Dernier code 2FA demandé il y a {int(elapsed)}s. Trade Republic "
+              f"limite les SMS rapprochés : si tu redemandes maintenant, le SMS "
+              f"risque de NE PAS arriver.")
+        ans = input(f"   Attendre ~{wait}s est recommandé. Redemander quand même ? [o/N] ").strip().lower()
+        if ans not in ("o", "oui", "y", "yes"):
+            print("Annulé — relance dans un moment.")
+            sys.exit(0)
+
+
+def _twofa_loop(api):
+    """Boucle de saisie du code 2FA : attend, permet un renvoi propre, valide.
+
+    Reste dans le MÊME run (pas besoin de quitter/relancer, ce qui déclencherait
+    un nouveau login complet et le rate-limit).
+    """
+    while True:
+        code = input(
+            "Code 2FA (tape-le, 'r' = renvoyer, Entrée = j'attends encore) : "
+        ).strip().lower()
+
+        if code == "":
+            print("… j'attends le SMS. Tape le code dès qu'il arrive, ou 'r' pour en renvoyer un.")
+            continue
+
+        if code == "r":
+            since = _since_last_2fa()
+            if since is not None and since < _RESEND_MIN_S:
+                print(f"   Trop tôt pour renvoyer (attends encore ~{int(_RESEND_MIN_S - since)}s "
+                      f"pour ne pas te faire bloquer par TR).")
+                continue
+            try:
+                api.resend_weblogin()          # renvoi sur la MÊME session TR
+                _LAST_2FA_FILE.touch()
+                print("↻ Nouveau code demandé (même session). Attends le SMS…")
+            except Exception as e:
+                print(f"   Échec du renvoi ({e!r}). Attends puis relance le script.")
+            continue
+
+        if not code.isdigit():
+            print("   Le code est uniquement numérique. Réessaie.")
+            continue
+
+        try:
+            api.complete_weblogin(code)
+            return
+        except Exception as e:
+            print(f"   Code refusé ({e!r}). Retape-le, ou 'r' pour en renvoyer un.")
+
+
 def connect():
     """Connexion TR via les helpers du connecteur. Reprend la session, sinon 2FA."""
     phone = os.environ.get("TR_PHONE") or input("Numéro Trade Republic (06… ou +33…) : ").strip()
@@ -111,10 +182,11 @@ def connect():
     if api.resume_websession():
         print("✓ Session reprise (pas de 2FA).")
         return
-    print("Connexion… un code 2FA va être envoyé.")
+    _sms_cooldown_guard()
     countdown = api.initiate_weblogin()
-    code = input(f"Code 2FA reçu (valide ~{countdown}s) : ").strip()
-    api.complete_weblogin(code)
+    _LAST_2FA_FILE.touch()          # horodate la demande pour le garde-fou
+    print(f"Connexion… code 2FA envoyé par SMS (valide ~{countdown}s, peut prendre 1-2 min).")
+    _twofa_loop(api)
     print("✓ Connecté.")
 
 

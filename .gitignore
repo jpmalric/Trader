@@ -11,3 +11,5 @@ isin_map.json
 # Python
 __pycache__/
 *.pyc
+
+.tr_last_2fa
