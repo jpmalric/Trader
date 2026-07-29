@@ -7,6 +7,10 @@
 
 # Caches dérivés (régénérés automatiquement)
 isin_map.json
+*cache*.json
+
+# Rapports générés (régénérés automatiquement)
+*.html
 
 # Python
 __pycache__/
