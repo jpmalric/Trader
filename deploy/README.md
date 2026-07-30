@@ -56,17 +56,39 @@ journalctl -u pea-report.service -n 30    # logs du dernier run
 
 Fréquence : voir `OnCalendar` dans `pea-report.timer` (par défaut Lun–Ven à 8h/11h/14h/17h/20h, heure de Paris).
 
-## 3. Caddy
+## 3. Caddy (intégration à un Caddyfile existant)
+
+Ajoute le bloc de `deploy/Caddyfile` à ton `/etc/caddy/Caddyfile` (remplace
+`pea.tondomaine.fr` par ton sous-domaine), puis :
 
 ```bash
-sudo cp deploy/Caddyfile /etc/caddy/Caddyfile   # ou intègre le bloc à ton Caddyfile existant
+sudo mkdir -p /var/log/caddy
+sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-- Accès LAN : `http://<IP_DU_LXC>/`
-- Accès externe : fais pointer ton tunnel Cloudflare (`cloudflared`) vers `http://127.0.0.1:80`.
-  Comme Cloudflare gère le TLS au bord, Caddy reste en HTTP simple. Pense à activer
-  **Cloudflare Access** si tu veux restreindre l'accès externe.
+- Accès LAN : `http://<IP_DU_LXC>/` (si tu as un bloc `:80` par défaut).
+- Accès externe : `https://pea.tondomaine.fr/` via le tunnel.
+
+## 4. Cloudflare Tunnel
+
+Fais pointer le hostname public sur Caddy en HTTP local. Deux options :
+
+**Dashboard** (Zero Trust → Networks → Tunnels → ton tunnel → Public Hostname) :
+- Subdomain `pea`, Domain `tondomaine.fr`
+- Service : `HTTP` → `127.0.0.1:80`
+
+**Ou config.yml de `cloudflared`** :
+
+```yaml
+ingress:
+  - hostname: pea.tondomaine.fr
+    service: http://127.0.0.1:80
+  - service: http_status:404
+```
+
+Cloudflare gère le TLS au bord, donc Caddy reste en HTTP simple. Active
+**Cloudflare Access** sur ce hostname si tu veux restreindre l'accès externe.
 
 ## Notes
 
