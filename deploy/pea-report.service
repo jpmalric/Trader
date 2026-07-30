@@ -1,0 +1,12 @@
+[Unit]
+Description=Régénère le rapport PEA (pea_screener2.py) et le publie pour Caddy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adapte l'utilisateur si tu ne veux pas tourner en root :
+User=root
+ExecStart=/opt/trader/deploy/refresh_report.sh
+# Coupe le job s'il dépasse 10 min (une source de données peut pendre)
+TimeoutStartSec=600

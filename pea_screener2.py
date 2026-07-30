@@ -1008,6 +1008,7 @@ def generate_html_report(output: Path) -> None:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="1800">
 <title>PEA Screener v2 — QARP</title>
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}

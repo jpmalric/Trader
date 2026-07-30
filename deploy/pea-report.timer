@@ -1,0 +1,11 @@
+[Unit]
+Description=Rafraîchit le rapport PEA plusieurs fois par jour
+
+[Timer]
+# Jours de bourse, aux heures de séance (Europe/Paris). Adapte à ta guise.
+OnCalendar=Mon..Fri 08,11,14,17,20:00 Europe/Paris
+# Rejoue au démarrage si une exécution a été manquée (LXC éteint, etc.)
+Persistent=true
+
+[Install]
+WantedBy=timers.target

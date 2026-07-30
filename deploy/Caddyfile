@@ -1,0 +1,22 @@
+# Caddyfile — sert le rapport PEA en HTTP local.
+# Cloudflare Tunnel (cloudflared) se branche dessus pour l'accès externe + TLS,
+# donc pas besoin de HTTPS ni de domaine ici : on écoute en clair sur :80.
+#
+# Accès LAN :        http://<IP_DU_LXC>/
+# Accès externe :    via ton tunnel Cloudflare pointant sur http://127.0.0.1:80
+
+:80 {
+	root * /var/www/pea
+	file_server
+	encode gzip
+
+	# --- Optionnel : protéger l'accès LAN par mot de passe ---
+	# Génère le hash avec :  caddy hash-password
+	# basic_auth {
+	#     jp <HASH_BCRYPT>
+	# }
+
+	log {
+		output file /var/log/caddy/pea.log
+	}
+}
