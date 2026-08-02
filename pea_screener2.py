@@ -1,23 +1,36 @@
 #!/usr/bin/env python3
 """
-PEA Screener v2 — Algorithme QARP (Quality at a Reasonable Price)
+PEA Screener v4 — Algorithme QARP (Quality at a Reasonable Price)
 
-Améliorations majeures vs v1 :
-  · 6 nouvelles métriques : ROA, marge brute, marge opérationnelle, P/FCF,
-    ratio courant, trésorerie nette / cap, dette / EBITDA
-  · P/FCF remplace FCF yield (mesure plus directe et moins manipulable)
-  · Normalisation sectorielle : blend 65 % univers / 35 % secteur Yahoo Finance
-  · Badge QARP : conviction quand (rentab.×0.6 + crois.×0.4) ≥ 65 ET valo ≥ 60
-  · Pénalité value-trap : score capé à 50 si rentabilité < 30e centile
-  · 5 piliers indépendants affichés avec décomposition dans le rapport HTML
-  · Table triable par colonne, filtre secteur + QARP + grade minimum
+Affinages v4 (2e revue) :
+  · Croissance 1 an écrêtée (effets de base cycliques ignorés) et poids réduit ;
+    PEG retiré de la valorisation (double comptage de cette croissance).
+  · Métriques non pertinentes neutralisées pour les banques (ROA, marge brute/opérat.,
+    trésorerie nette) — valorisation bancaire sur P/B ; P/FCF < 2x traité en artefact.
+  · Éligibilité PEA affichée (siège UE/EEE) + filtre + badge « hors PEA » ; devise de
+    COTATION distincte de celle des états financiers ; rendement de dividende NET estimé
+    après retenue à la source non récupérable en PEA ; blend secteur ↑ (concentration).
 
-Piliers (total = 100 %) :
-  Rentabilité    30 % : ROE 9 · ROA 7 · Marge brute 7 · Marge opérat. 7
-  Croissance     20 % : Croiss. CA 7 · Croiss. bén. 8 · Révision EPS 5
-  Valorisation   25 % : P/FCF 10 · EV/EBITDA 9 · PEG 6
-  Momentum       15 % : Perf 52s 6 · % Achat 5 · Upside cible 4
-  Santé fin.     10 % : Ratio courant 4 · Trés. nette 3 · Dette/EBITDA 3
+Fondations v3 (méthodologie & qualité des données) :
+  · CLASSEMENT = Qualité^0.6 × Valorisation^0.4 (moyenne géométrique) — la
+    valorisation MORD enfin (corr. valo↔score ≈ 0.55 vs ≈ 0 en v2, où la somme
+    additive laissait la qualité racheter la cherté).
+  · Fin de l'imputation à 50 : centiles renormalisés sur les seuls facteurs
+    PRÉSENTS ; couverture de données affichée et décotée sous 60 %.
+  · Fin de l'inversion des extrêmes : plus de plafond P/FCF>150→50 (les titres
+    les plus chers étaient notés « médians ») ; les extrêmes prennent leur vrai rang.
+  · Facteurs adaptés au secteur (P/FCF, dette/EBITDA… ignorés pour les banques ;
+    P/B ajouté comme ancrage de valorisation, utile aux financières).
+  · Timing (perf 52s + révisions EPS) et Consensus analystes (% Achat + upside)
+    CALCULÉS et AFFICHÉS mais HORS classement (« quand entrer » ≠ « quoi acheter »).
+  · Garde-fou upside implausible (devise/staleness) + contrôles de cohérence.
+  · Snapshots horodatés (dossier snapshots/) : fondation d'un futur backtest.
+
+Piliers :
+  Qualité (classement)  : Rentabilité · Croissance · Santé fin.
+  Valorisation (classt) : P/FCF · EV/EBITDA · PEG · P/B
+  Timing (hors classt)  : Perf 52s · Révision EPS
+  Consensus (hors clst) : % Achat · Upside cible
 
 Usage :
     python pea_screener2.py                  # cache si dispo
@@ -44,6 +57,7 @@ from curl_cffi import requests as cr
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 CACHE_FILE       = Path("pea_cache2.json")
+SNAPSHOT_DIR     = Path("snapshots")   # instantanés horodatés des scores (backtest)
 CACHE_TTL_H      = 20
 MIN_ANALYSTS     = 5
 TOP_N            = 50
@@ -51,53 +65,90 @@ DELAY_S          = 1.5
 RETRY_MAX        = 3
 BASE_QUERY       = "https://query2.finance.yahoo.com"
 FIRMS_LOOKBACK_D = 180
-SECTOR_BLEND     = 0.35   # poids de la normalisation sectorielle
+SECTOR_BLEND     = 0.45   # poids de la normalisation sectorielle (v4 : ↑ pour limiter
+                          # la concentration cross-secteur, ex. toutes les banques « pas chères »)
 
 # ── Piliers & pondérations ─────────────────────────────────────────────────────
 
-SCORE_WEIGHTS: list[tuple[str, float, bool]] = [
-    # Rentabilité (30 %)
-    ("roe",            0.09, True),
-    ("roa",            0.07, True),
-    ("gross_margin",   0.07, True),
-    ("op_margin",      0.07, True),
-    # Croissance (20 %)
-    ("rev_growth",     0.07, True),
-    ("earn_growth",    0.08, True),
-    ("eps_revision",   0.05, True),
-    # Valorisation (25 %)
-    ("pfcf",           0.10, False),
-    ("ev_ebitda",      0.09, False),
-    ("peg_ratio",      0.06, False),
-    # Momentum (15 %)
-    ("mom_52w",        0.06, True),
-    ("buy_pct",        0.05, True),
-    ("upside_pct",     0.04, True),
-    # Santé financière (10 %)
-    ("current_ratio",  0.04, True),
-    ("net_cash_yield", 0.03, True),
-    ("debt_cover",     0.03, False),
+# v3 — le score de CLASSEMENT est « qualité × valorisation » (moyenne géométrique),
+# et non une somme pondérée où la valorisation, anti-corrélée à la qualité, s'annulait
+# (corr. valo↔composite ≈ 0 en v2). Le Timing (momentum de prix + révisions d'EPS) et
+# le Consensus analystes sont calculés et affichés mais N'ENTRENT PAS dans le classement :
+# ils répondent au « quand entrer », pas au « quoi acheter ».
+#
+# Chaque pilier : (nom, groupe, [(champ, poids_intra, ascending)], couleur).
+#   ascending=True → valeur haute = mieux ;  groupe ∈ {quality, value, timing, consensus}
+
+PILLARS: list[tuple] = [
+    ("Rentabilité",  "quality",   [("roe", 3, True), ("roa", 2, True),
+                                    ("gross_margin", 2, True), ("op_margin", 3, True)], "#38bdf8"),
+    ("Croissance",   "quality",   [("rev_growth", 1, True), ("earn_growth", 1, True)],  "#34d399"),
+    ("Santé fin.",   "quality",   [("current_ratio", 1, True), ("net_cash_yield", 1, True),
+                                    ("debt_cover", 1, False)],                           "#fb7185"),
+    # PEG retiré (v4) : double comptait la croissance 1 an déjà surestimée sur les
+    # cycliques (un pétrolier au pic bénéficiaire ressortait « pas cher » via son PEG).
+    ("Valorisation", "value",     [("pfcf", 3, False), ("ev_ebitda", 3, False),
+                                    ("pb", 3, False)],                                   "#f59e0b"),
+    ("Timing",       "timing",    [("mom_52w", 1, True), ("eps_revision", 1, True)],     "#a78bfa"),
+    ("Consensus",    "consensus", [("buy_pct", 1, True), ("upside_pct", 1, True)],       "#64748b"),
 ]
 
-assert abs(sum(w for _, w, _ in SCORE_WEIGHTS) - 1.0) < 1e-9, "Poids invalides"
+# Poids relatifs des piliers "quality" dans le score de qualité global.
+# v4 : Croissance abaissée (glissement 1 an bruité, effets de base cycliques) ; la
+# qualité repose surtout sur la rentabilité, plus stable.
+QUALITY_PILLAR_WEIGHTS = {"Rentabilité": 0.55, "Croissance": 0.20, "Santé fin.": 0.25}
 
-# (nom, [(champ, poids), ...], couleur_accent)
-PILLARS = [
-    ("Rentabilité",   [("roe",0.09),("roa",0.07),("gross_margin",0.07),("op_margin",0.07)],  "#38bdf8"),
-    ("Croissance",    [("rev_growth",0.07),("earn_growth",0.08),("eps_revision",0.05)],       "#34d399"),
-    ("Valorisation",  [("pfcf",0.10),("ev_ebitda",0.09),("peg_ratio",0.06)],                 "#f59e0b"),
-    ("Momentum",      [("mom_52w",0.06),("buy_pct",0.05),("upside_pct",0.04)],               "#a78bfa"),
-    ("Santé fin.",    [("current_ratio",0.04),("net_cash_yield",0.03),("debt_cover",0.03)],   "#fb7185"),
-]
+# Moyenne géométrique qualité × valorisation (exposants, somme = 1).
+QARP_QUALITY_EXP = 0.60
+QARP_VALUE_EXP   = 0.40
+
+# Couverture de données minimale : en dessous, le titre est signalé et décoté.
+MIN_COVERAGE = 0.60
+
+# Croissance 1 an au-delà de ce seuil (%) = effet de base non fiable → ignorée.
+GROWTH_MAX_ABS = {"rev_growth": 100.0, "earn_growth": 150.0}
+
+# Facteurs non pertinents selon le secteur (évite d'imputer une valeur neutre à un
+# ratio qui n'a pas de sens pour ce type d'activité).
+# Banques/assureurs : P/FCF, EV/EBITDA, ratio courant, dette/EBITDA, marge brute,
+# ROA et « trésorerie nette / cap » n'ont pas de sens (bilan = dépôts). Faute de
+# CET1/NPL/LCR via Yahoo, on ne score pas leur santé de bilan plutôt que de la fausser.
+SECTOR_INAPPLICABLE = {
+    # op_margin inclus : la « marge opérationnelle » Yahoo est trompeuse pour une
+    # banque (revenus = marge d'intérêt + commissions) et gonflait leur qualité.
+    # Reste pour les financières : ROE + croissance + P/B (+ timing/consensus).
+    "financial": {"pfcf", "ev_ebitda", "current_ratio", "debt_cover",
+                  "gross_margin", "roa", "net_cash_yield", "op_margin"},
+    "real_estate": {"current_ratio", "gross_margin"},
+}
+
+# Dérivés
+FIELD_ASCENDING: dict[str, bool] = {
+    f: asc for _, _, fields, _ in PILLARS for f, _, asc in fields
+}
+ALL_FACTORS: list[str] = list(FIELD_ASCENDING.keys())
+RANKING_GROUPS = ("quality", "value")   # groupes qui comptent dans le classement
 
 PILLAR_ABBREV = {"Rentabilité": "R", "Croissance": "C", "Valorisation": "V",
-                 "Momentum": "M", "Santé fin.": "S"}
+                 "Timing": "T", "Santé fin.": "S", "Consensus": "A"}
+
+
+def _factor_applicable(field: str, sector: str) -> bool:
+    """False si le facteur n'a pas de sens pour ce secteur (banque, foncière…)."""
+    s = (sector or "").lower()
+    if any(k in s for k in ("financial", "bank", "insurance")):
+        if field in SECTOR_INAPPLICABLE["financial"]:
+            return False
+    if "real estate" in s:
+        if field in SECTOR_INAPPLICABLE["real_estate"]:
+            return False
+    return True
 
 FACTOR_LABELS = {
     "roe": "ROE", "roa": "ROA", "gross_margin": "Marge br.",
     "op_margin": "Marge op.", "rev_growth": "Croiss. CA",
     "earn_growth": "Croiss. bén.", "eps_revision": "Rév. EPS",
-    "pfcf": "P/FCF", "ev_ebitda": "EV/EBITDA", "peg_ratio": "PEG",
+    "pfcf": "P/FCF", "ev_ebitda": "EV/EBITDA", "peg_ratio": "PEG", "pb": "P/B",
     "mom_52w": "Perf. 52s", "buy_pct": "% Achat", "upside_pct": "Upside",
     "current_ratio": "Ratio cour.", "net_cash_yield": "Trés. nette",
     "debt_cover": "Dette/EBITDA",
@@ -223,6 +274,27 @@ def pea_eligibility(country: str) -> bool | None:
         return None
     return c in PEA_ELIGIBLE_COUNTRIES
 
+
+# Retenue à la source sur dividendes NON récupérable dans un PEA (estimation, %).
+# Ordre de grandeur des taux résiduels usuels ; les traités et cas particuliers
+# peuvent modifier ces chiffres — à titre indicatif seulement.
+WITHHOLDING_PEA: dict[str, float] = {
+    "France": 0.0, "Germany": 26.375, "Spain": 19.0, "Netherlands": 15.0,
+    "Italy": 26.0, "Belgium": 30.0, "Denmark": 27.0, "Finland": 30.0,
+    "Sweden": 30.0, "Norway": 25.0, "Austria": 27.5, "Ireland": 25.0,
+    "Portugal": 28.0, "Luxembourg": 15.0, "Greece": 5.0, "Poland": 19.0,
+}
+
+
+def net_dividend_yield(gross_yield: float | None, country: str) -> float | None:
+    """Rendement net estimé après retenue à la source non récupérable en PEA."""
+    if gross_yield is None:
+        return None
+    wht = WITHHOLDING_PEA.get((country or "").strip())
+    if wht is None:
+        return None
+    return round(gross_yield * (1 - wht / 100), 2)
+
 # ── Cache ──────────────────────────────────────────────────────────────────────
 
 def load_cache() -> list | None:
@@ -286,7 +358,7 @@ class YahooSession:
                       modules: str = (
                           "financialData,recommendationTrend,quoteType,"
                           "summaryProfile,upgradeDowngradeHistory,"
-                          "defaultKeyStatistics,earningsTrend,summaryDetail"
+                          "defaultKeyStatistics,earningsTrend,summaryDetail,price"
                       )) -> dict:
         r = self._session.get(
             f"{BASE_QUERY}/v10/finance/quoteSummary/{symbol}",
@@ -343,6 +415,7 @@ def fetch_analyst_data(session: YahooSession, symbol: str) -> dict | None:
             ks  = data.get("defaultKeyStatistics",    {})
             et  = data.get("earningsTrend",           {})
             sd  = data.get("summaryDetail",           {})
+            pr  = data.get("price",                   {})
 
             mean  = _v(fd.get("recommendationMean"))
             count = _v(fd.get("numberOfAnalystOpinions"))
@@ -415,6 +488,7 @@ def fetch_analyst_data(session: YahooSession, symbol: str) -> dict | None:
             peg_ratio = _v(ks.get("pegRatio"))
             ev_ebitda = _v(ks.get("enterpriseToEbitda"))
             fwd_pe    = _v(ks.get("forwardPE"))
+            pb        = _v(ks.get("priceToBook")) or _v(sd.get("priceToBook"))
 
             # Momentum
             mom_52w = _pct(ks.get("52WeekChange"))
@@ -447,6 +521,7 @@ def fetch_analyst_data(session: YahooSession, symbol: str) -> dict | None:
                 "industry":      sp.get("industry",""),
                 "country":       sp.get("country",""),
                 "currency":      fd.get("financialCurrency",""),
+                "quote_currency": pr.get("currency","") or "",
                 # Consensus
                 "mean_score":    round(float(mean), 2),
                 "n_analysts":    int(count),
@@ -472,6 +547,7 @@ def fetch_analyst_data(session: YahooSession, symbol: str) -> dict | None:
                 "pfcf":          pfcf,
                 "ev_ebitda":     ev_ebitda,
                 "peg_ratio":     peg_ratio,
+                "pb":            pb,
                 "fwd_pe":        fwd_pe,
                 # Momentum
                 "mom_52w":       mom_52w,
@@ -540,72 +616,209 @@ def _sector_percentile_ranks(records: list[dict], values: list, ascending: bool)
 
     return ranks
 
-# ── Score composite QARP ───────────────────────────────────────────────────────
+# ── Score composite QARP (v3) ───────────────────────────────────────────────────
+
+def _pillar_score(pfields, sector, present, pmatrix, i):
+    """Score d'un pilier sur ses facteurs APPLICABLES au secteur ET PRÉSENTS.
+
+    Renormalise sur les seuls facteurs réellement disponibles (pas d'imputation à 50).
+    Renvoie (score|None, poids_présent, poids_applicable).
+    """
+    used_w = appl_w = acc = 0.0
+    for f, w, _asc in pfields:
+        if not _factor_applicable(f, sector):
+            continue
+        appl_w += w
+        if present[f][i]:
+            used_w += w
+            acc += w * pmatrix[f][i]
+    if used_w <= 0:
+        return None, 0.0, appl_w
+    return acc / used_w, used_w, appl_w
+
 
 def compute_composite_scores(records: list[dict]) -> list[dict]:
     if not records:
         return records
 
-    # Nettoyage des valeurs aberrantes
-    def clean_pfcf(v):     return v if (v is not None and 0 < v <= 150) else None
-    def clean_peg(v):      return v if (v is not None and 0 < v < 50)  else None
-    def clean_ev(v):       return v if (v is not None and v > 0)       else None
-    def clean_dc(v):       return v if (v is not None and 0 <= v <= 25) else None
-    def clean_cr(v):       return v if (v is not None and 0 < v <= 8)  else None
-    def clean_gm(v):       return v if (v is not None and -30 <= v <= 100) else None
+    # Nettoyage : on ne GARDE que les valeurs valides, mais on NE PLAFONNE PLUS les
+    # extrêmes (le classement par centile est insensible à l'échelle ; plafonner à 150
+    # puis imputer 50 renvoyait les titres les plus chers au milieu = inversion en v2).
+    def clean_pos(v):  return v if (v is not None and v > 0) else None          # ratios > 0
+    def clean_dc(v):   return v if (v is not None and v >= 0) else None         # dette/EBITDA
+    def clean_gm(v):   return v if (v is not None and -60 <= v <= 100) else None
+    def clean_pfcf(v):                                                          # < 2x = artefact
+        return v if (v is not None and v >= 2) else None                       # (FCF capital+captive)
+    def clean_rev(v):  return v if (v is not None and abs(v) <= GROWTH_MAX_ABS["rev_growth"]) else None
+    def clean_earn(v): return v if (v is not None and abs(v) <= GROWTH_MAX_ABS["earn_growth"]) else None
+    def keep(v):       return v
 
     CLEANERS = {
-        "pfcf": clean_pfcf, "peg_ratio": clean_peg, "ev_ebitda": clean_ev,
-        "debt_cover": clean_dc, "current_ratio": clean_cr, "gross_margin": clean_gm,
+        "pfcf": clean_pfcf, "ev_ebitda": clean_pos, "pb": clean_pos,
+        "current_ratio": clean_pos, "debt_cover": clean_dc, "gross_margin": clean_gm,
+        "rev_growth": clean_rev, "earn_growth": clean_earn,
     }
 
-    # Vecteurs de valeurs nettoyées
+    # Garde-fou upside : neutralise les valeurs implausibles (souvent devise non
+    # convertie ou cible périmée) pour qu'elles ne polluent pas le Consensus.
+    for r in records:
+        u = r.get("upside_pct")
+        r["upside_suspect"] = u is not None and (u > 100 or u < -60)
+        r["upside_used"] = None if r["upside_suspect"] else u
+
+    # Vecteurs nettoyés + masque de présence
     field_vectors: dict[str, list] = {}
-    for fname, _, _ in SCORE_WEIGHTS:
-        cleaner = CLEANERS.get(fname, lambda x: x)
-        field_vectors[fname] = [cleaner(r.get(fname)) for r in records]
+    for f in ALL_FACTORS:
+        src = "upside_used" if f == "upside_pct" else f
+        cleaner = CLEANERS.get(f, keep)
+        field_vectors[f] = [cleaner(r.get(src)) for r in records]
+    present = {f: [v is not None for v in field_vectors[f]] for f in ALL_FACTORS}
 
     # Centiles blend : 65 % univers global + 35 % secteur
-    percentile_matrix: dict[str, list[float]] = {}
-    for fname, _, ascending in SCORE_WEIGHTS:
-        g = _percentile_ranks(field_vectors[fname], ascending)
-        s = _sector_percentile_ranks(records, field_vectors[fname], ascending)
-        percentile_matrix[fname] = [
-            (1 - SECTOR_BLEND) * gv + SECTOR_BLEND * sv
-            for gv, sv in zip(g, s)
-        ]
+    pmatrix: dict[str, list[float]] = {}
+    for f in ALL_FACTORS:
+        asc = FIELD_ASCENDING[f]
+        g = _percentile_ranks(field_vectors[f], asc)
+        s = _sector_percentile_ranks(records, field_vectors[f], asc)
+        pmatrix[f] = [(1 - SECTOR_BLEND) * gv + SECTOR_BLEND * sv for gv, sv in zip(g, s)]
 
     for i, rec in enumerate(records):
-        # Score brut
-        composite = sum(w * percentile_matrix[f][i] for f, w, _ in SCORE_WEIGHTS)
+        sector = rec.get("sector")
+        pillar_scores: dict[str, float | None] = {}
+        pillar_cov: dict[str, tuple] = {}
+        for pname, _group, pfields, _c in PILLARS:
+            sc, uw, aw = _pillar_score(pfields, sector, present, pmatrix, i)
+            pillar_scores[pname] = round(sc, 1) if sc is not None else None
+            pillar_cov[pname] = (uw, aw)
 
-        # Scores par pilier (0-100, normalisés à leur poids total)
-        pillar_scores: dict[str, float] = {}
-        for pname, pfields, _ in PILLARS:
-            tw = sum(w for _, w in pfields)
-            ps = sum(w * percentile_matrix[f][i] for f, w in pfields) / tw if tw > 0 else 50.0
-            pillar_scores[pname] = round(ps, 1)
+        # Qualité = blend des piliers "quality" présents (renormalisé)
+        qw = qa = 0.0
+        for pname, w in QUALITY_PILLAR_WEIGHTS.items():
+            sc = pillar_scores.get(pname)
+            if sc is not None:
+                qa += w * sc
+                qw += w
+        quality   = qa / qw if qw > 0 else None
+        value     = pillar_scores.get("Valorisation")
+        timing    = pillar_scores.get("Timing")
+        consensus = pillar_scores.get("Consensus")
 
-        score_detail = {f: round(percentile_matrix[f][i], 1) for f, _, _ in SCORE_WEIGHTS}
+        # Classement = moyenne géométrique qualité × valorisation (le « reasonable
+        # price » de QARP MORD enfin : excellent mais cher, ou cher-de-mauvaise-qualité,
+        # sont tous deux tirés vers le bas — ce qu'une somme additive ne faisait pas).
+        if quality is not None and value is not None:
+            q = max(quality, 1.0)
+            v = max(value, 1.0)
+            core = 100.0 * (q / 100) ** QARP_QUALITY_EXP * (v / 100) ** QARP_VALUE_EXP
+        elif quality is not None:
+            core = quality * 0.85          # pas de valorisation exploitable → décote
+        else:
+            core = None
 
-        # ── QARP : rentabilité-croissance ≥ 65 ET valorisation ≥ 60 ──────────
-        rent = pillar_scores.get("Rentabilité", 50)
-        croi = pillar_scores.get("Croissance",  50)
-        valo = pillar_scores.get("Valorisation", 50)
-        qual_growth = rent * 0.60 + croi * 0.40   # blend qualité+croissance
-        is_qarp = qual_growth >= 65 and valo >= 60
+        # Couverture des données (sur les groupes qui comptent dans le classement)
+        cov_used = cov_appl = 0.0
+        for pname, group, _pf, _c in PILLARS:
+            if group in RANKING_GROUPS:
+                uw, aw = pillar_cov[pname]
+                cov_used += uw
+                cov_appl += aw
+        coverage = cov_used / cov_appl if cov_appl > 0 else 0.0
 
-        # Pénalité value-trap : si la rentabilité est trop faible, cap le score
-        if rent < 30:
-            composite = min(composite, 50.0)
+        # Décote de couverture douce (jusqu'à -20 % sous le seuil)
+        if core is not None and coverage < MIN_COVERAGE:
+            core *= 0.80 + 0.20 * (coverage / MIN_COVERAGE)
 
-        rec["composite"]    = round(composite, 1)
-        rec["grade"]        = score_to_grade(composite)
-        rec["conviction"]   = is_qarp
-        rec["pillar_scores"]= pillar_scores
-        rec["score_detail"] = score_detail
+        # QARP recalibré : bonne qualité ET valorisation correcte. Seuils un peu
+        # desserrés (la moyenne géométrique écrase les scores → sinon trop peu de titres).
+        is_qarp = (quality is not None and value is not None
+                   and quality >= 58 and value >= 52)
+        # Piège de valeur : valorisation attrayante mais qualité faible
+        value_trap = (value is not None and quality is not None
+                      and value >= 60 and quality < 40)
+
+        rec["composite"]      = round(core, 1) if core is not None else None
+        rec["grade"]          = score_to_grade(core) if core is not None else None
+        rec["quality_score"]  = round(quality, 1) if quality is not None else None
+        rec["value_score"]    = round(value, 1) if value is not None else None
+        rec["timing_score"]   = round(timing, 1) if timing is not None else None
+        rec["consensus_score"] = round(consensus, 1) if consensus is not None else None
+        rec["coverage"]       = round(coverage, 3)
+        rec["conviction"]     = is_qarp
+        rec["value_trap"]     = value_trap
+        rec["pillar_scores"]  = pillar_scores
+        rec["score_detail"]   = {
+            f: (round(pmatrix[f][i], 1) if present[f][i] else None) for f in ALL_FACTORS
+        }
 
     return records
+
+# ── Contrôles de cohérence & snapshots ──────────────────────────────────────────
+
+def data_quality_report(records: list[dict]) -> list[str]:
+    """Signale (sans bloquer) les données douteuses : upside implausible, couverture
+    faible, titres non classés, dividendes périmés."""
+    warns: list[str] = []
+    now = datetime.now()
+
+    suspect = [r["symbol"] for r in records if r.get("upside_suspect")]
+    if suspect:
+        warns.append(f"Upside implausible neutralisé (devise/staleness ?) : {', '.join(suspect)}")
+
+    low_cov = [r["symbol"] for r in records
+               if r.get("composite") is not None and r.get("coverage", 1) < MIN_COVERAGE]
+    if low_cov:
+        warns.append(f"Couverture < {int(MIN_COVERAGE*100)} % (score décoté) : {', '.join(low_cov)}")
+
+    no_score = [r["symbol"] for r in records if r.get("composite") is None]
+    if no_score:
+        warns.append(f"Non classés — données insuffisantes : {', '.join(no_score)}")
+
+    stale = []
+    for r in records:
+        d = r.get("ex_div_date") or r.get("last_div_date")
+        if not d:
+            continue
+        try:
+            if (now - datetime.strptime(d, "%d/%m/%Y")).days > 400:
+                stale.append(f"{r['symbol']}({d})")
+        except ValueError:
+            pass
+    if stale:
+        warns.append(f"Date de dividende périmée >400 j : {', '.join(stale[:12])}"
+                     + (" …" if len(stale) > 12 else ""))
+    return warns
+
+
+def print_data_quality(records: list[dict]) -> None:
+    warns = data_quality_report(records)
+    if not warns:
+        print("  Contrôles de cohérence : OK.")
+        return
+    print(f"\n  ⚠ Contrôles de cohérence ({len(warns)}) :")
+    for w in warns:
+        print(f"    · {w}")
+
+
+def save_snapshot(records: list[dict]) -> None:
+    """Instantané horodaté (1/jour) des scores — fondation d'un futur backtest
+    (information coefficient, spread de quintiles). N'écrase que le jour courant."""
+    try:
+        SNAPSHOT_DIR.mkdir(exist_ok=True)
+        day = datetime.now().strftime("%Y-%m-%d")
+        rows = [{
+            "symbol": r["symbol"], "composite": r.get("composite"),
+            "quality": r.get("quality_score"), "value": r.get("value_score"),
+            "timing": r.get("timing_score"), "consensus": r.get("consensus_score"),
+            "grade": r.get("grade"), "coverage": r.get("coverage"),
+            "conviction": r.get("conviction"), "price": r.get("price"),
+        } for r in records]
+        path = SNAPSHOT_DIR / f"{day}.json"
+        path.write_text(json.dumps({"date": day, "rows": rows}, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        print(f"  Snapshot → {path}")
+    except Exception as e:
+        print(f"  (snapshot non écrit : {e})")
+
 
 # ── Enrichissement cabinets ────────────────────────────────────────────────────
 
@@ -646,9 +859,12 @@ def run_screener(force_refresh: bool = False, min_analysts: int = MIN_ANALYSTS) 
     if not force_refresh:
         records = load_cache()
         if records is not None:
-            if any(r.get("composite") is None for r in records):
+            # Recalcule si le cache est d'un schéma antérieur (v2 → v3)
+            if any(("quality_score" not in r) or r.get("composite") is None for r in records):
                 records = compute_composite_scores(records)
                 save_cache(records)
+            print_data_quality(records)
+            save_snapshot(records)
             return pd.DataFrame(records)
 
     session = YahooSession()
@@ -679,7 +895,10 @@ def run_screener(force_refresh: bool = False, min_analysts: int = MIN_ANALYSTS) 
 
     records = compute_composite_scores(records)
     save_cache(records)
-    print(f"  Cache v2 → {CACHE_FILE}\n")
+    print(f"  Cache v2 → {CACHE_FILE}")
+    print_data_quality(records)
+    save_snapshot(records)
+    print()
     return pd.DataFrame(records)
 
 # ── Affichage terminal ─────────────────────────────────────────────────────────
@@ -706,32 +925,40 @@ def display_results(df: pd.DataFrame, top_n: int, min_composite: float,
         df = df[df["composite"].notna() & (df["composite"] >= min_composite)]
         df = df.sort_values("composite", ascending=False)
     df = df.head(top_n).reset_index(drop=True)
-    W = 160
+
+    def _n(v, w=5, dec=0):
+        """Formate un score None/NaN-safe (aligné à droite)."""
+        return f"{v:>{w}.{dec}f}" if pd.notna(v) else f"{'—':>{w}}"
+
+    W = 150
     print()
     print("=" * W)
-    print(f"{'TOP PEA — ALGORITHME QARP v2  (Quality at a Reasonable Price)':^{W}}")
-    print(f"{'Rent.(30%) · Crois.(20%) · Valo.(25%) · Mom.(15%) · Santé(10%)  ·  blend 65 % univers / 35 % secteur':^{W}}")
+    print(f"{'TOP PEA — QARP v4  (Quality at a Reasonable Price)':^{W}}")
+    print(f"{'Classement = Qualité^0.6 × Valorisation^0.4  ·  Timing & Consensus = hors classement  ·  blend 65 % univers / 35 % secteur':^{W}}")
     print("=" * W)
-    print(f"{'#':>3}  {'Sym':<12} {'Nom':<28}  {'Score':>6} {'G':>3} {'QARP':>5}"
-          f"  {'Rent':>5} {'Croi':>5} {'Valo':>5} {'Mom':>5} {'Snt':>5}"
+    print(f"{'#':>3}  {'Sym':<11} {'Nom':<26}  {'Score':>6} {'G':>3} {'QARP':>5}"
+          f"  {'Qual':>5} {'Valo':>5} {'Tim':>5} {'Cons':>5} {'Cov':>5}"
           f"  {'P/FCF':>7} {'Upside':>7}  Consensus")
     print("-" * W)
     for idx, row in df.iterrows():
-        ps    = row.get("pillar_scores") or {}
-        qarp  = " ★QARP" if row.get("conviction") else "      "
+        qarp  = " ★QARP" if row.get("conviction") else ("  ⚠VT " if row.get("value_trap") else "      ")
         pfcf  = row.get("pfcf")
-        pfcf_s = f"{pfcf:.1f}x" if pfcf else "  N/A "
+        pfcf_s = f"{pfcf:.1f}x" if pd.notna(pfcf) and pfcf else "  N/A "
         up    = row.get("upside_pct")
-        up_s  = (f"+{up:.1f}%" if up and up > 0 else f"{up:.1f}%" if up else "  N/A ").rjust(7)
+        up    = up if pd.notna(up) else None
+        up_sfx = " ?" if row.get("upside_suspect") else ""
+        up_s  = ((f"+{up:.1f}%" if up and up > 0 else f"{up:.1f}%" if up is not None else "N/A") + up_sfx).rjust(7)
+        cov   = row.get("coverage")
+        cov_s = f"{cov*100:>4.0f}%" if cov is not None else "   —"
         label = CONSENSUS_LABEL.get(str(row.get("consensus","")).lower(), str(row.get("consensus","")).upper())
         print(
-            f"{idx+1:>3}  {str(row['symbol']):<12} {str(row.get('name',''))[:27]:<28}"
-            f"  {row.get('composite',0):>6.1f} {row.get('grade','?'):>3}{qarp}"
-            f"  {ps.get('Rentabilité',0):>5.0f}"
-            f" {ps.get('Croissance',0):>5.0f}"
-            f" {ps.get('Valorisation',0):>5.0f}"
-            f" {ps.get('Momentum',0):>5.0f}"
-            f" {ps.get('Santé fin.',0):>5.0f}"
+            f"{idx+1:>3}  {str(row['symbol']):<11} {str(row.get('name',''))[:25]:<26}"
+            f"  {_n(row.get('composite'),6,1)} {str(row.get('grade') or '—'):>3}{qarp}"
+            f"  {_n(row.get('quality_score'))}"
+            f" {_n(row.get('value_score'))}"
+            f" {_n(row.get('timing_score'))}"
+            f" {_n(row.get('consensus_score'))}"
+            f" {cov_s:>5}"
             f"  {pfcf_s:>7} {up_s}  {label}"
         )
     print("-" * W)
@@ -755,8 +982,8 @@ def generate_html_report(output: Path) -> None:
     cached_at = datetime.fromisoformat(cache["cached_at"]).strftime("%d/%m/%Y %H:%M")
     generated = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    # Recalcul si nécessaire (cache sans scores v2)
-    if any(r.get("pillar_scores") is None for r in records):
+    # Recalcul si nécessaire (cache d'un schéma antérieur ou scores manquants)
+    if any(("quality_score" not in r) or r.get("pillar_scores") is None for r in records):
         records = compute_composite_scores(records)
 
     records = sorted(records, key=lambda r: r.get("composite") or 0, reverse=True)
@@ -769,6 +996,7 @@ def generate_html_report(output: Path) -> None:
     n_hold   = sum(1 for r in records if r.get("consensus","").lower() == "hold")
     n_sell   = sum(1 for r in records if r.get("consensus","").lower() in ("sell","strong_sell","underperform"))
     n_cab    = sum(1 for r in records if r.get("firms"))
+    n_pea_no = sum(1 for r in records if pea_eligibility(r.get("country")) is False)
     sectors  = sorted({(r.get("sector") or "").strip() for r in records if (r.get("sector") or "").strip()})
     sector_opts = "".join(f'<option value="{s}">{s}</option>' for s in sectors)
 
@@ -790,6 +1018,23 @@ def generate_html_report(output: Path) -> None:
     def _sc(v):
         return _score_color(v)
 
+    _PCT_FIELDS = {"roe", "roa", "gross_margin", "op_margin", "rev_growth",
+                   "earn_growth", "eps_revision", "mom_52w", "net_cash_yield",
+                   "buy_pct", "upside_pct"}
+
+    def _abs_fmt(f, val):
+        """Valeur ABSOLUE lisible (le centile seul ne dit pas 12 % ou 40 %)."""
+        if val is None:
+            return "—"
+        if f in _PCT_FIELDS:
+            return f"{val:+.1f}%" if f in ("mom_52w", "eps_revision", "upside_pct",
+                                           "rev_growth", "earn_growth") else f"{val:.1f}%"
+        if f in ("pfcf", "ev_ebitda"):
+            return f"{val:.1f}x"
+        if f in ("peg_ratio", "pb", "current_ratio", "debt_cover"):
+            return f"{val:.2f}"
+        return f"{val}"
+
     def _compbar(score):
         if score is None: return '<div class="comp-na">N/A</div>'
         c = _sc(score)
@@ -804,19 +1049,24 @@ def generate_html_report(output: Path) -> None:
         c = COMP_GRADE_COLOR.get(grade, "#64748b")
         return f'<div class="grade-badge" style="background:{c}20;color:{c};border:2px solid {c}60">{grade}</div>'
 
-    def _qarp_badge(is_qarp):
-        if not is_qarp: return '<td class="center qarp-cell"></td>'
-        return '<td class="center qarp-cell"><span class="qarp-badge" title="Quality at a Reasonable Price&#10;Rentabilité+Croissance ≥ 65 · Valorisation ≥ 60">★ QARP</span></td>'
+    def _qarp_badge(r):
+        if r.get("conviction"):
+            return ('<td class="center qarp-cell"><span class="qarp-badge" '
+                    'title="Quality at a Reasonable Price&#10;Qualité ≥ 60 ET Valorisation ≥ 55">★ QARP</span></td>')
+        if r.get("value_trap"):
+            return ('<td class="center qarp-cell"><span class="vt-badge" '
+                    'title="Valorisation attrayante mais qualité faible (≥60 valo, <40 qualité)">⚠ piège ?</span></td>')
+        return '<td class="center qarp-cell"></td>'
 
     def _pillar_mini(ps):
         if not ps: return '<td class="center"><div class="pm-row">—</div></td>'
         items = ""
-        for pname, _, _ in PILLARS:
-            score = ps.get(pname, 50)
+        for pname, _grp, _pf, _c in PILLARS:
+            score = ps.get(pname)
             c = _sc(score)
             abbr = PILLAR_ABBREV.get(pname, pname[0])
-            items += (f'<span class="pm" style="background:{c}" '
-                      f'title="{pname}: {score:.0f}/100">{abbr}</span>')
+            title = f"{pname}: {score:.0f}/100" if score is not None else f"{pname}: N/A"
+            items += f'<span class="pm" style="background:{c}" title="{title}">{abbr}</span>'
         return f'<td class="center"><div class="pm-row">{items}</div></td>'
 
     def _buybar(pct_val):
@@ -839,11 +1089,14 @@ def generate_html_report(output: Path) -> None:
                 parts.append(f'<div class="seg" style="width:{cnt/total*100:.1f}%;background:{c}" title="{lbl}: {cnt}"></div>')
         return f'<div class="breakdown" title="SB:{sb} B:{b} N:{h} V:{se} VF:{ss}">{"".join(parts)}</div>'
 
-    def _upside(val):
-        if val is None: return '<td class="center gray">N/A</td>'
+    def _upside(val, suspect=False):
+        if val is None:
+            txt = "suspect" if suspect else "N/A"
+            return f'<td class="center gray small" title="Upside ignoré (devise/staleness)">{txt}</td>'
         c = "#16a34a" if val > 0 else "#ef4444"
         s = "+" if val > 0 else ""
-        return f'<td class="center" style="color:{c};font-weight:600">{s}{val:.1f}%</td>'
+        mark = ' <span style="color:#f97316" title="devise/staleness ?">?</span>' if suspect else ""
+        return f'<td class="center" style="color:{c};font-weight:600">{s}{val:.1f}%{mark}</td>'
 
     def _pfcf_cell(pfcf):
         if pfcf is None: return '<td class="center gray small">N/A</td>'
@@ -853,11 +1106,19 @@ def generate_html_report(output: Path) -> None:
     def _div_cell(r):
         rate = r.get("div_rate") or r.get("last_div_val")
         ex_d = r.get("ex_div_date") or r.get("last_div_date")
-        cur  = r.get("currency","")
+        cur  = r.get("quote_currency") or r.get("currency","")
         if rate is None: return '<td class="center gray div-cell">—</td>'
         rate_str = f"{rate:.2f} {cur}".strip()
-        dy = r.get("div_yield")
-        dy_html   = f'<div class="div-yield">({dy:.2f}%)</div>' if dy else ""
+        dy  = r.get("div_yield")
+        net = net_dividend_yield(dy, r.get("country"))
+        if dy and net is not None and net < dy - 0.01:
+            dy_html = (f'<div class="div-yield">{dy:.2f}% '
+                       f'<span class="div-net" title="Rendement net estimé après retenue à la '
+                       f'source non récupérable en PEA (approximatif)">→ {net:.2f}% net</span></div>')
+        elif dy:
+            dy_html = f'<div class="div-yield">{dy:.2f}%</div>'
+        else:
+            dy_html = ""
         date_html = f'<div class="div-date">{ex_d}</div>' if ex_d else ""
         return f'<td class="center small div-cell"><div class="div-amount">{rate_str}</div>{dy_html}{date_html}</td>'
 
@@ -870,45 +1131,60 @@ def generate_html_report(output: Path) -> None:
         c = GRADE_COLOR.get(norm,"#64748b"); l = GRADE_LABEL.get(norm, norm)
         return f'<span class="firm-badge" style="background:{c}20;color:{c};border:1px solid {c}40">{l}</span>'
 
-    def _pillar_section(ps, sd):
+    GROUP_TAG = {"quality": "qualité", "value": "valorisation",
+                 "timing": "timing · hors classement", "consensus": "analystes · hors classement"}
+
+    def _pillar_section(ps, sd, r):
         if not ps:
             return '<div class="sd-empty">Score non calculé — relancez avec <code>--refresh</code>.</div>'
         html_parts = ['<div class="pillar-section">']
-        for pname, pfields, pcolor in PILLARS:
-            pscore = ps.get(pname, 50)
+        for pname, group, pfields, pcolor in PILLARS:
+            pscore = ps.get(pname)
             c = _sc(pscore)
-            tw = sum(w for _, w in pfields)
-            wpct = round(tw * 100)
             factor_parts = []
-            if sd:
-                for f, _ in pfields:
-                    fval = sd.get(f)
-                    lbl  = FACTOR_LABELS.get(f, f)
-                    if fval is not None:
-                        fc = _sc(fval)
-                        factor_parts.append(
-                            f'<span style="color:{fc}">{lbl}: <b>{fval:.0f}</b></span>'
-                        )
-                    else:
-                        factor_parts.append(f'<span class="gray">{lbl}: N/A</span>')
+            for f, _w, _asc in pfields:
+                pct = (sd or {}).get(f)                 # centile (0-100)
+                raw = r.get(f)                           # valeur absolue
+                lbl = FACTOR_LABELS.get(f, f)
+                if pct is not None:
+                    factor_parts.append(
+                        f'<span style="color:{_sc(pct)}">{lbl}: <b>{pct:.0f}</b>'
+                        f'<span class="fx-abs">({_abs_fmt(f, raw)})</span></span>'
+                    )
+                elif not _factor_applicable(f, r.get("sector")):
+                    factor_parts.append(f'<span class="gray">{lbl}: n/a secteur</span>')
+                else:
+                    factor_parts.append(f'<span class="gray">{lbl}: N/A</span>')
             factors_html = ' &nbsp;·&nbsp; '.join(factor_parts)
+            score_txt = f"{pscore:.0f}" if pscore is not None else "—"
+            bar_w = pscore if pscore is not None else 0
             html_parts.append(
                 f'<div class="pi-item">'
                 f'<div class="pi-header">'
                 f'<span class="pi-name" style="color:{pcolor}">{pname}</span>'
-                f'<span class="pi-weight">{wpct}%</span>'
-                f'<span class="pi-score" style="color:{c}">{pscore:.0f}'
+                f'<span class="pi-weight">{GROUP_TAG.get(group, "")}</span>'
+                f'<span class="pi-score" style="color:{c}">{score_txt}'
                 f'<span class="pi-max">/100</span></span>'
                 f'</div>'
-                f'<div class="pi-bar-wrap"><div class="pi-bar" style="width:{pscore:.0f}%;background:{c}"></div></div>'
+                f'<div class="pi-bar-wrap"><div class="pi-bar" style="width:{bar_w:.0f}%;background:{c}"></div></div>'
                 f'<div class="pi-factors">{factors_html}</div>'
                 f'</div>'
             )
+        # Ligne de synthèse : qualité × valorisation + couverture
+        q = r.get("quality_score"); v = r.get("value_score"); cov = r.get("coverage")
+        vt = ' &nbsp;·&nbsp; <span style="color:#f97316">⚠ piège de valeur possible</span>' if r.get("value_trap") else ""
+        sus = ' &nbsp;·&nbsp; <span style="color:#f97316">upside suspect (ignoré)</span>' if r.get("upside_suspect") else ""
+        html_parts.append(
+            f'<div class="pi-synth">Classement = Qualité <b>{q if q is not None else "—"}</b> '
+            f'× Valorisation <b>{v if v is not None else "—"}</b> '
+            f'&nbsp;·&nbsp; couverture données <b>{cov*100:.0f}%</b>{vt}{sus}</div>'
+            if cov is not None else '<div class="pi-synth"></div>'
+        )
         html_parts.append('</div>')
         return "".join(html_parts)
 
-    def _detail_row(idx, firms, ps, sd):
-        pillar_sec = _pillar_section(ps, sd)
+    def _detail_row(idx, firms, ps, sd, r):
+        pillar_sec = _pillar_section(ps, sd, r)
         if not firms:
             firms_html = '<div class="no-firms">Aucune recommandation de cabinet (180 j).</div>'
         else:
@@ -945,22 +1221,35 @@ def generate_html_report(output: Path) -> None:
         name   = (r.get("name") or r["symbol"])[:38]
         sector = r.get("sector","") or ""
         comp   = r.get("composite")
-        grade  = r.get("grade","")
+        grade  = r.get("grade") or ""
         ps     = r.get("pillar_scores") or {}
         sd     = r.get("score_detail")
         firms  = r.get("firms") or []
         conv   = r.get("conviction", False)
-        price  = r.get("price"); target = r.get("target_price"); cur = r.get("currency","")
+        price  = r.get("price"); target = r.get("target_price")
+        cur    = r.get("quote_currency") or r.get("currency","")
         buy_p  = r.get("buy_pct",0) or 0
         pfcf   = r.get("pfcf")
         upside = r.get("upside_pct")
+        suspect = r.get("upside_suspect", False)
 
-        ps_str = f"{ps.get('Rentabilité',0):.0f}/{ps.get('Croissance',0):.0f}/{ps.get('Valorisation',0):.0f}/{ps.get('Momentum',0):.0f}/{ps.get('Santé fin.',0):.0f}"
-        ps_val = {k: f"{v:.0f}" for k, v in ps.items()}
+        country = r.get("country","") or ""
+        elig = pea_eligibility(country)
+        elig_key = {True: "ok", False: "no", None: "unk"}[elig]
+        if elig is False:
+            elig_html = f' <span class="pea-no" title="Siège {country} — hors UE/EEE, non éligible PEA">⚠ hors PEA</span>'
+        elif elig is None:
+            elig_html = ' <span class="pea-unk" title="Pays du siège inconnu — à vérifier">? PEA</span>'
+        else:
+            elig_html = ""
+        meta_txt = f'{sector}{" · " + country if country else ""}'
 
-        price_td = (f'<div class="price-cur">{price:.2f}</div>'
-                    f'<div class="price-tgt">{target:.2f} <span class="price-ccy">{cur}</span></div>'
-                    if price else '<div class="price-cur gray">N/A</div>')
+        if price:
+            tgt_html = (f'<div class="price-tgt">{target:.2f} <span class="price-ccy">{cur}</span></div>'
+                        if target else '<div class="price-tgt gray">cible N/A</div>')
+            price_td = f'<div class="price-cur">{price:.2f}</div>{tgt_html}'
+        else:
+            price_td = '<div class="price-cur gray">N/A</div>'
 
         tbtn = (f'<button class="toggle-btn" onclick="event.stopPropagation();toggleDetail({i})" '
                 f'title="{len(firms)} cabinets">&#9658; {len(firms)}</button>'
@@ -968,38 +1257,36 @@ def generate_html_report(output: Path) -> None:
 
         rows_html += (
             f'<tr class="main-row" '
-            f'data-composite="{comp or 0}" '
+            f'data-composite="{comp if comp is not None else -1}" '
             f'data-sector="{sector}" '
             f'data-grade="{grade}" '
             f'data-symbol="{r["symbol"]}" '
             f'data-pfcf="{pfcf or 0}" '
             f'data-upside="{upside or 0}" '
             f'data-buy="{buy_p}" '
-            f'data-rent="{ps.get("Rentabilité",0):.0f}" '
-            f'data-croi="{ps.get("Croissance",0):.0f}" '
-            f'data-valo="{ps.get("Valorisation",0):.0f}" '
-            f'data-mom="{ps.get("Momentum",0):.0f}" '
-            f'data-sante="{ps.get("Santé fin.",0):.0f}" '
+            f'data-quality="{r.get("quality_score") or 0}" '
+            f'data-value="{r.get("value_score") or 0}" '
             f'data-qarp="{1 if conv else 0}" '
+            f'data-elig="{elig_key}" '
             f'onclick="toggleDetail({i})" style="cursor:pointer">'
             f'<td class="center rank">{i+1}</td>'
             f'<td class="comp-cell">{_compbar(comp)}</td>'
             f'<td class="center grade-cell">{_gbadge(grade)}</td>'
-            f'{_qarp_badge(conv)}'
+            f'{_qarp_badge(r)}'
             f'<td><span class="ticker">{r["symbol"]}</span></td>'
             f'<td class="name-cell" title="{r.get("name","")}">'
-            f'<div class="name">{name}</div>'
-            f'<div class="meta">{sector}</div></td>'
+            f'<div class="name">{name}{elig_html}</div>'
+            f'<div class="meta">{meta_txt}</div></td>'
             f'{_pillar_mini(ps)}'
             f'<td>{_buybar(buy_p)}</td>'
             f'{_pfcf_cell(pfcf)}'
-            f'{_upside(upside)}'
+            f'{_upside(upside, suspect)}'
             f'<td class="center small price-cell">{price_td}</td>'
             f'{_div_cell(r)}'
             f'<td class="center">{_cbadge(r.get("consensus",""))}</td>'
             f'<td class="center">{tbtn}</td>'
             f'</tr>'
-            f'{_detail_row(i, firms, ps, sd)}'
+            f'{_detail_row(i, firms, ps, sd, r)}'
         )
 
     # ── Template HTML ──────────────────────────────────────────────────────────
@@ -1078,6 +1365,18 @@ def generate_html_report(output: Path) -> None:
   .qarp-badge {{ display: inline-block; background: #f59e0b20; color: #f59e0b;
                  border: 1px solid #f59e0b60; padding: 2px 7px; border-radius: 12px;
                  font-size: 11px; font-weight: 700; white-space: nowrap; cursor: default; }}
+  .vt-badge {{ display: inline-block; background: #f9731618; color: #fb923c;
+               border: 1px solid #f9731640; padding: 2px 6px; border-radius: 12px;
+               font-size: 10px; font-weight: 600; white-space: nowrap; cursor: default; }}
+  .fx-abs {{ color: #475569; font-weight: 400; margin-left: 3px; }}
+  .pea-no {{ color: #f87171; font-size: 10px; font-weight: 700; border: 1px solid #f8717140;
+             padding: 0 4px; border-radius: 4px; white-space: nowrap; cursor: help; }}
+  .pea-unk {{ color: #94a3b8; font-size: 10px; font-weight: 600; border: 1px solid #94a3b840;
+              padding: 0 4px; border-radius: 4px; white-space: nowrap; cursor: help; }}
+  .div-net {{ color: #f59e0b; font-size: 10px; cursor: help; }}
+  .pi-synth {{ margin-top: 6px; padding-top: 8px; border-top: 1px dashed #1e293b;
+               font-size: 11px; color: #94a3b8; }}
+  .pi-synth b {{ color: #e2e8f0; }}
   .pm-row {{ display: flex; gap: 2px; justify-content: center; }}
   .pm {{ display: inline-flex; align-items: center; justify-content: center;
          width: 18px; height: 18px; border-radius: 3px; font-size: 10px; font-weight: 700;
@@ -1137,17 +1436,16 @@ def generate_html_report(output: Path) -> None:
 </head>
 <body>
 <header>
-  <h1>PEA Screener v2 &mdash; <span>Algorithme QARP</span></h1>
+  <h1>PEA Screener <span>v4 &mdash; QARP</span></h1>
   <p>Quality at a Reasonable Price &bull; Source : Yahoo Finance &bull;
      Données du {cached_at} &bull; Rapport généré le {generated}</p>
 </header>
 <div class="algo-bar">
-  <span>Rentabilité 30 %</span> ROE · ROA · Marge brute · Marge opérat. &nbsp;|&nbsp;
-  <span>Croissance 20 %</span> Croiss. CA · Croiss. bén. · Rév. EPS &nbsp;|&nbsp;
-  <span>Valorisation 25 %</span> P/FCF · EV/EBITDA · PEG &nbsp;|&nbsp;
-  <span>Momentum 15 %</span> Perf 52s · % Achat · Upside &nbsp;|&nbsp;
-  <span>Santé 10 %</span> Ratio cour. · Trés. nette · Dette/EBITDA &nbsp;|&nbsp;
-  <span>Blend</span> 65 % univers / 35 % secteur
+  <span>Classement = Qualité<sup>0.6</sup> × Valorisation<sup>0.4</sup></span> (moyenne géométrique) &nbsp;|&nbsp;
+  <span>Qualité :</span> Rentabilité · Croissance · Santé fin. &nbsp;|&nbsp;
+  <span>Valorisation :</span> P/FCF · EV/EBITDA · PEG · P/B &nbsp;|&nbsp;
+  <span>Hors classement :</span> Timing (Perf 52s · Rév. EPS) · Consensus (% Achat · Upside) &nbsp;|&nbsp;
+  <span>Facteurs</span> adaptés au secteur · centiles renormalisés sur données présentes · blend 65/35
 </div>
 <div class="kpi-row">
   <div class="kpi blue"><div class="val">{len(records)}</div><div class="lbl">Actions analysées</div></div>
@@ -1157,6 +1455,7 @@ def generate_html_report(output: Path) -> None:
   <div class="kpi lime"><div class="val">{n_buy}</div><div class="lbl">Achat</div></div>
   <div class="kpi yellow"><div class="val">{n_hold}</div><div class="lbl">Neutre</div></div>
   <div class="kpi red"><div class="val">{n_sell}</div><div class="lbl">Vente / Sous-perf</div></div>
+  <div class="kpi red"><div class="val">{n_pea_no}</div><div class="lbl">Hors PEA (siège)</div></div>
   <div class="kpi purple"><div class="val">{n_cab}</div><div class="lbl">Avec cabinets</div></div>
 </div>
 <div class="filter-bar">
@@ -1167,6 +1466,7 @@ def generate_html_report(output: Path) -> None:
   </select>
   <span class="sep">|</span>
   <button class="fbtn" id="qarp-btn" onclick="toggleQarp()">★ QARP uniquement</button>
+  <button class="fbtn" id="pea-btn" onclick="togglePea()">PEA éligible uniquement</button>
   <span class="sep">|</span>
   <label>Grade min.</label>
   <button class="fbtn active" id="g-all" onclick="filterGrade(this,'')">Tous</button>
@@ -1180,11 +1480,18 @@ def generate_html_report(output: Path) -> None:
   <span style="color:#94a3b8;font-size:11px">Piliers :</span>
   <div class="pl-item"><div class="pl-dot" style="background:#38bdf8"></div><span style="color:#38bdf8">R = Rentabilité</span></div>
   <div class="pl-item"><div class="pl-dot" style="background:#34d399"></div><span style="color:#34d399">C = Croissance</span></div>
-  <div class="pl-item"><div class="pl-dot" style="background:#f59e0b"></div><span style="color:#f59e0b">V = Valorisation</span></div>
-  <div class="pl-item"><div class="pl-dot" style="background:#a78bfa"></div><span style="color:#a78bfa">M = Momentum</span></div>
   <div class="pl-item"><div class="pl-dot" style="background:#fb7185"></div><span style="color:#fb7185">S = Santé fin.</span></div>
-  <span style="color:#475569;margin-left:8px">· Cliquez sur une ligne pour le détail ·</span>
-  <span style="color:#475569">P/FCF : <span style="color:#16a34a">&lt;15x</span> excellent · <span style="color:#22c55e">&lt;25x</span> bon · <span style="color:#eab308">&lt;40x</span> correct · <span style="color:#ef4444">≥40x</span> cher</span>
+  <div class="pl-item"><div class="pl-dot" style="background:#f59e0b"></div><span style="color:#f59e0b">V = Valorisation</span></div>
+  <div class="pl-item"><div class="pl-dot" style="background:#a78bfa"></div><span style="color:#a78bfa">T = Timing*</span></div>
+  <div class="pl-item"><div class="pl-dot" style="background:#64748b"></div><span style="color:#64748b">A = Analystes*</span></div>
+  <span style="color:#475569">*hors classement</span>
+  <span style="color:#475569;margin-left:8px">· Chaque pilier : centile 0-100 (valeur absolue entre parenthèses) · Cliquez une ligne pour le détail ·</span>
+  <span style="color:#64748b;width:100%;margin-top:6px;line-height:1.7">
+    <b style="color:#f59e0b">★ QARP</b> = Qualité ≥ 58 ET Valorisation ≥ 52 &nbsp;·&nbsp;
+    <b style="color:#fb923c">⚠ piège ?</b> = Valorisation ≥ 60 mais Qualité &lt; 40 (piège de valeur possible) &nbsp;·&nbsp;
+    <b style="color:#f87171">⚠ hors PEA</b> = siège hors UE/EEE (non logeable) &nbsp;·&nbsp;
+    dividende <b style="color:#f59e0b">→ x % net</b> = estimation après retenue à la source non récupérable en PEA
+  </span>
 </div>
 <div class="table-wrap">
   <table>
@@ -1195,7 +1502,7 @@ def generate_html_report(output: Path) -> None:
       <th>QARP</th>
       <th class="sortable" onclick="sortBy('symbol')">Symbole <span class="sort-arrow" id="arr-symbol">↕</span></th>
       <th>Société / Secteur</th>
-      <th class="center" title="R=Rentab. C=Crois. V=Valo. M=Mom. S=Santé">Piliers</th>
+      <th class="center" title="R=Rentab. C=Crois. S=Santé V=Valo. T=Timing* A=Analystes* (*hors classement)">Piliers</th>
       <th class="sortable center" onclick="sortBy('buy')">% Achat <span class="sort-arrow" id="arr-buy">↕</span></th>
       <th class="sortable center" onclick="sortBy('pfcf')">P/FCF <span class="sort-arrow" id="arr-pfcf">↕</span></th>
       <th class="sortable center" onclick="sortBy('upside')">Upside <span class="sort-arrow" id="arr-upside">↕</span></th>
@@ -1208,13 +1515,16 @@ def generate_html_report(output: Path) -> None:
   </table>
 </div>
 <footer>
-  QARP v2 : Rentab.(30%) · Crois.(20%) · Valo.(25%) · Mom.(15%) · Santé(10%) &bull;
-  16 facteurs · blend 65 % univers / 35 % secteur Yahoo Finance &bull;
-  Yahoo Finance · {generated} &bull;
-  Pas un conseil en investissement — à titre informatif uniquement.
+  QARP v4 : classement = Qualité<sup>0.6</sup> × Valorisation<sup>0.4</sup> &bull;
+  Timing &amp; Consensus analystes affichés mais hors classement &bull;
+  centiles <b>relatifs</b> à l'univers ({len(records)} titres), renormalisés sur les données présentes,
+  facteurs adaptés au secteur &bull; blend 65 % univers / 35 % secteur &bull;
+  Source Yahoo Finance · {generated}<br>
+  Un score élevé = « meilleur du panier », pas « bon dans l'absolu ». Données non recoupées.
+  <b>Pas un conseil en investissement — à titre informatif uniquement.</b>
 </footer>
 <script>
-  let filterState = {{ sector: '', qarp: false, grade: '' }};
+  let filterState = {{ sector: '', qarp: false, grade: '', pea: false }};
   let sortState   = {{ col: 'composite', asc: false }};
 
   const GRADE_ORDER = ['S','A+','A','B+','B','C','D','F'];
@@ -1278,6 +1588,12 @@ def generate_html_report(output: Path) -> None:
     applyFiltersToRows();
   }}
 
+  function togglePea() {{
+    filterState.pea = !filterState.pea;
+    document.getElementById('pea-btn').classList.toggle('active', filterState.pea);
+    applyFiltersToRows();
+  }}
+
   function filterGrade(btn, grade) {{
     filterState.grade = grade;
     document.querySelectorAll('[id^="g-"]').forEach(b => b.classList.remove('active'));
@@ -1290,6 +1606,7 @@ def generate_html_report(output: Path) -> None:
       let show = true;
       if (filterState.sector && m.dataset.sector !== filterState.sector) show = false;
       if (filterState.qarp && m.dataset.qarp !== '1') show = false;
+      if (filterState.pea && m.dataset.elig !== 'ok') show = false;
       if (filterState.grade) {{
         const ri = GRADE_ORDER.indexOf(m.dataset.grade);
         const mi = GRADE_ORDER.indexOf(filterState.grade);
@@ -1302,9 +1619,10 @@ def generate_html_report(output: Path) -> None:
   }}
 
   function resetFilters() {{
-    filterState = {{ sector: '', qarp: false, grade: '' }};
+    filterState = {{ sector: '', qarp: false, grade: '', pea: false }};
     document.getElementById('sector-filter').value = '';
     document.getElementById('qarp-btn').classList.remove('active');
+    document.getElementById('pea-btn').classList.remove('active');
     document.querySelectorAll('[id^="g-"]').forEach(b => b.classList.remove('active'));
     document.getElementById('g-all').classList.add('active');
     getPairs().forEach(([m, d]) => {{ m.style.display = ''; }});

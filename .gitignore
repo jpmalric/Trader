@@ -1,19 +1,10 @@
-# Session / secrets Trade Republic — NE JAMAIS committer
-.tr_cookies.txt
-.tr_credentials
-.tr_code.txt
-.tr_login_status
-.mcp.json
-
-# Caches dérivés (régénérés automatiquement)
-isin_map.json
+# Caches & rapports générés (régénérés automatiquement)
 *cache*.json
-
-# Rapports générés (régénérés automatiquement)
 *.html
+
+# Instantanés de scores (fondation backtest, régénérés à chaque run)
+snapshots/
 
 # Python
 __pycache__/
 *.pyc
-
-.tr_last_2fa
